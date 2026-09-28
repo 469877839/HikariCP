@@ -152,6 +152,13 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
    /**
     * The method will borrow a BagEntry from the bag, blocking for the
     * specified timeout if none are available.
+    * <p>
+    * Borrowing is fair with respect to threads that are already waiting:
+    * if any thread is queued ahead of us, the thread-local list and the
+    * shared list scan are bypassed, and we take our place at the tail of
+    * the (FIFO) handoff queue.  Idle entries are routed to waiting threads
+    * through that same handoff channel, so a returned item is always handed
+    * to the longest-waiting thread rather than being snatched by a newcomer.
     *
     * @param timeout how long to wait before giving up, in units of unit
     * @param timeUnit a <code>TimeUnit</code> determining how to interpret the timeout parameter
@@ -160,27 +167,41 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
     */
    public T borrow(long timeout, final TimeUnit timeUnit) throws InterruptedException
    {
-      // Try the thread-local list first
-      final var list = threadLocalList.get();
-      for (var i = list.size() - 1; i >= 0; i--) {
-         final var entry = list.remove(i);
-         @SuppressWarnings("unchecked")
-         final T bagEntry = useWeakThreadLocals ? ((WeakReference<T>) entry).get() : (T) entry;
-         if (bagEntry != null && bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
-            return bagEntry;
+      // Try the thread-local list first, but only when no threads are waiting;
+      // otherwise a queued thread could be bypassed by this "fast path".
+      if (waiters.get() == 0) {
+         final var list = threadLocalList.get();
+         for (var i = list.size() - 1; i >= 0; i--) {
+            final var entry = list.remove(i);
+            @SuppressWarnings("unchecked")
+            final T bagEntry = useWeakThreadLocals ? ((WeakReference<T>) entry).get() : (T) entry;
+            if (bagEntry != null && bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
+               return bagEntry;
+            }
          }
       }
 
-      // Otherwise, scan the shared list ... then poll the handoff queue
+      // Register as a waiter, then either scan the shared list (only if nobody
+      // is queued ahead of us) or poll the handoff queue in FIFO order.
       final var waiting = waiters.incrementAndGet();
       try {
-         for (T bagEntry : sharedList) {
-            if (bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
-               // If we may have stolen another waiter's connection, request another bag add.
-               if (waiting > 1) {
-                  listener.addBagItem(waiting - 1);
+         if (waiting == 1) {
+            // No other thread is waiting ahead of us, so scanning the shared
+            // list directly cannot bypass anyone.
+            for (T bagEntry : sharedList) {
+               if (bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
+                  return bagEntry;
                }
-               return bagEntry;
+            }
+         }
+         else {
+            // Threads are already queued ahead of us.  Route any idle entries
+            // through the handoff queue so they reach the longest-waiting
+            // thread, instead of taking one for ourselves.
+            for (T bagEntry : sharedList) {
+               if (bagEntry.getState() == STATE_NOT_IN_USE) {
+                  handoffQueue.offer(bagEntry);
+               }
             }
          }
 
