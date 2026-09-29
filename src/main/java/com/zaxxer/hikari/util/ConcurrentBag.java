@@ -22,12 +22,13 @@ import org.slf4j.LoggerFactory;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
+import java.lang.invoke.VarHandle;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
@@ -36,7 +37,7 @@ import static com.zaxxer.hikari.util.ClockSource.currentTime;
 import static com.zaxxer.hikari.util.ClockSource.elapsedNanos;
 import static com.zaxxer.hikari.util.ConcurrentBag.IConcurrentBagEntry.*;
 import static java.util.concurrent.TimeUnit.MICROSECONDS;
-import static java.util.concurrent.TimeUnit.NANOSECONDS;
+import static java.util.concurrent.locks.LockSupport.unpark;
 import static java.util.concurrent.locks.LockSupport.parkNanos;
 
 /**
@@ -46,8 +47,9 @@ import static java.util.concurrent.locks.LockSupport.parkNanos;
  * locks, but resorts to scanning a common collection if there are no
  * available items in the ThreadLocal list.  Not-in-use items in the
  * ThreadLocal lists can be "stolen" when the borrowing thread has none
- * of its own.  It is a "lock-less" implementation using a specialized
- * AbstractQueuedLongSynchronizer to manage cross-thread signaling.
+ * of its own.  It is a "lock-less" implementation using a FIFO queue of
+ * registered waiters to manage cross-thread signaling; when threads are
+ * waiting, returned items are handed to the longest-waiting thread first.
  * <p>
  * Note that items that are "borrowed" from the bag are not actually
  * removed from any collection, so garbage collection will not occur
@@ -66,6 +68,18 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
    private static final Logger LOGGER = LoggerFactory.getLogger(ConcurrentBag.class);
    private static final MethodHandle THREAD_IS_VIRTUAL = resolveThreadIsVirtual();
 
+   private static final Object CANCELLED = new Object();
+   private static final VarHandle HANDOFF;
+
+   static {
+      try {
+         HANDOFF = MethodHandles.lookup().findVarHandle(Waiter.class, "handoff", Object.class);
+      }
+      catch (final ReflectiveOperationException e) {
+         throw new ExceptionInInitializerError(e);
+      }
+   }
+
    private final CopyOnWriteArrayList<T> sharedList;
    private final boolean useWeakThreadLocals;
 
@@ -74,7 +88,21 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
    private final AtomicInteger waiters;
    private volatile boolean closed;
 
-   private final SynchronousQueue<T> handoffQueue;
+   private final ConcurrentLinkedQueue<Waiter> handoffQueue;
+
+   /**
+    * A registered waiter for a bag entry.  Waiters are enqueued in the
+    * {@link #handoffQueue} in arrival order, and entries are always handed
+    * to the longest-waiting (head) waiter first.  The {@link #handoff} field
+    * is {@code null} while the waiter is pending, {@link #CANCELLED} once the
+    * waiter has given up (timeout, interruption, or satisfied by the shared
+    * list), or the entry delivered by a returning thread.
+    */
+   private static final class Waiter
+   {
+      final Thread thread = Thread.currentThread();
+      volatile Object handoff;
+   }
 
    private static MethodHandle resolveThreadIsVirtual()
    {
@@ -141,7 +169,7 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
       this.listener = listener;
       this.useWeakThreadLocals = useWeakThreadLocals();
 
-      this.handoffQueue = new SynchronousQueue<>(true);
+      this.handoffQueue = new ConcurrentLinkedQueue<>();
       this.waiters = new AtomicInteger();
       this.sharedList = new CopyOnWriteArrayList<>();
       this.threadLocalList = ThreadLocal.withInitial(() ->
@@ -171,36 +199,85 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
          }
       }
 
-      // Otherwise, scan the shared list ... then poll the handoff queue
+      // Register as a waiter *before* scanning the shared list.  Combined with
+      // requite() publishing the entry before consulting the waiter count, this
+      // guarantees that a concurrently returned entry is either handed directly
+      // to a registered waiter or is visible to our shared-list scan below.
+      final var waiter = new Waiter();
       final var waiting = waiters.incrementAndGet();
+      handoffQueue.offer(waiter);
+
+      T racedHandoff = null;
       try {
+         // Otherwise, scan the shared list
          for (T bagEntry : sharedList) {
             if (bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
                // If we may have stolen another waiter's connection, request another bag add.
                if (waiting > 1) {
                   listener.addBagItem(waiting - 1);
                }
+               if (!HANDOFF.compareAndSet(waiter, null, CANCELLED)) {
+                  // a returning thread raced us and won; we cannot use both entries
+                  racedHandoff = handoffOf(waiter);
+               }
+               handoffQueue.remove(waiter);
                return bagEntry;
             }
          }
 
          listener.addBagItem(waiting);
 
-         timeout = timeUnit.toNanos(timeout);
+         // The deadline is computed once, from the moment the wait starts, and is not
+         // extended by spurious wake-ups.
+         var remaining = timeUnit.toNanos(timeout);
          do {
             final var start = currentTime();
-            final T bagEntry = handoffQueue.poll(timeout, NANOSECONDS);
-            if (bagEntry == null || bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
-               return bagEntry;
+            parkNanos(remaining);
+            if (Thread.interrupted()) {
+               if (!HANDOFF.compareAndSet(waiter, null, CANCELLED)) {
+                  racedHandoff = handoffOf(waiter);
+               }
+               handoffQueue.remove(waiter);
+               throw new InterruptedException();
             }
 
-            timeout -= elapsedNanos(start);
-         } while (timeout > 10_000);
+            final var handoff = waiter.handoff;
+            if (handoff != null) {
+               handoffQueue.remove(waiter);
+               @SuppressWarnings("unchecked")
+               final T bagEntry = (T) handoff;
+               if (bagEntry.getState() == STATE_IN_USE) {
+                  return bagEntry;
+               }
+               // The entry was removed from the bag while in flight to us;
+               // re-register and keep waiting on the remaining time.
+               waiter.handoff = null;
+               handoffQueue.offer(waiter);
+            }
 
+            remaining -= elapsedNanos(start);
+         } while (remaining > 10_000);
+
+         if (HANDOFF.compareAndSet(waiter, null, CANCELLED)) {
+            handoffQueue.remove(waiter);
+            return null;
+         }
+
+         // a returning thread delivered an entry just as we gave up; it is ours
+         handoffQueue.remove(waiter);
+         final T bagEntry = handoffOf(waiter);
+         if (bagEntry.getState() == STATE_IN_USE) {
+            return bagEntry;
+         }
          return null;
       }
       finally {
          waiters.decrementAndGet();
+         if (racedHandoff != null && racedHandoff.compareAndSet(STATE_IN_USE, STATE_NOT_IN_USE)) {
+            // The entry was claimed for us by a returning thread, but we already
+            // have one (or can no longer use it); hand it to the next in line.
+            tryHandoff(racedHandoff);
+         }
       }
    }
 
@@ -217,17 +294,8 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
    {
       bagEntry.setState(STATE_NOT_IN_USE);
 
-      final var isVirtualThread = isCurrentThreadVirtual();
-      for (int i = 1, waiting = waiters.get(); waiting > 0; i++, waiting = waiters.get()) {
-         if (bagEntry.getState() != STATE_NOT_IN_USE || handoffQueue.offer(bagEntry)) {
-            return;
-         }
-         else if (isVirtualThread || (i & 0xff) == 0xff || (waiting > 1 && i % waiting == 0)) {
-            parkNanos(MICROSECONDS.toNanos(10));
-         }
-         else {
-            Thread.yield();
-         }
+      if (tryHandoff(bagEntry)) {
+         return;
       }
 
       final var threadLocalEntries = this.threadLocalList.get();
@@ -250,10 +318,8 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
 
       sharedList.add(bagEntry);
 
-      // spin until a thread takes it or none are waiting
-      while (waiters.get() > 0 && bagEntry.getState() == STATE_NOT_IN_USE && !handoffQueue.offer(bagEntry)) {
-         Thread.yield();
-      }
+      // hand the entry directly to the longest-waiting borrower, if any
+      tryHandoff(bagEntry);
    }
 
    /**
@@ -348,19 +414,8 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
    public void unreserve(final T bagEntry)
    {
       if (bagEntry.compareAndSet(STATE_RESERVED, STATE_NOT_IN_USE)) {
-         // spin until a thread takes it or none are waiting
-         final var isVirtualThread = isCurrentThreadVirtual();
-         for (int i = 1, waiting = waiters.get(); waiting > 0; i++, waiting = waiters.get()) {
-            if (bagEntry.getState() != STATE_NOT_IN_USE || handoffQueue.offer(bagEntry)) {
-               return;
-            }
-            else if (isVirtualThread || (i & 0xff) == 0xff || (waiting > 1 && i % waiting == 0)) {
-               parkNanos(MICROSECONDS.toNanos(10));
-            }
-            else {
-               Thread.yield();
-            }
-         }
+         // hand the entry directly to the longest-waiting borrower, if any
+         tryHandoff(bagEntry);
       }
       else {
          LOGGER.warn("Attempt to relinquish an object to the bag that was not reserved: {}", bagEntry);
@@ -376,6 +431,69 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
    public int getWaitingThreadCount()
    {
       return waiters.get();
+   }
+
+   /**
+    * Attempt to hand an entry directly to a waiting borrower.  Waiters are
+    * served strictly first-come, first-served: the entry is always offered to
+    * the head of the waiter queue, and is claimed (STATE_NOT_IN_USE to
+    * STATE_IN_USE) on behalf of that waiter before it is delivered, so that
+    * no later borrower can steal it from the shared list while it is in
+    * flight.
+    *
+    * @param bagEntry the entry to hand off, in STATE_NOT_IN_USE
+    * @return true if the entry was delivered to a waiter (or was concurrently
+    *         taken by a shared-list scan), false if no thread is waiting
+    */
+   private boolean tryHandoff(final T bagEntry)
+   {
+      final var isVirtualThread = isCurrentThreadVirtual();
+      for (int i = 1, waiting = waiters.get(); waiting > 0; i++, waiting = waiters.get()) {
+         final var waiter = handoffQueue.peek();
+         if (waiter == null) {
+            // a borrower has registered its intent but has not linked its node
+            // into the queue yet; back off briefly and re-check
+            backoff(isVirtualThread, i, waiting);
+            continue;
+         }
+
+         if (!bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
+            // taken by a concurrent shared-list scan; no longer ours to give
+            return true;
+         }
+
+         if (HANDOFF.compareAndSet(waiter, null, bagEntry)) {
+            handoffQueue.remove(waiter);
+            unpark(waiter.thread);
+            return true;
+         }
+
+         // the head waiter gave up concurrently; unclaim the entry, prune the
+         // cancelled waiter, and try the next one in line
+         if (!bagEntry.compareAndSet(STATE_IN_USE, STATE_NOT_IN_USE)) {
+            // removed or reserved while in flight; no longer ours to give
+            return true;
+         }
+         handoffQueue.remove(waiter);
+      }
+
+      return false;
+   }
+
+   private static void backoff(final boolean isVirtualThread, final int i, final int waiting)
+   {
+      if (isVirtualThread || (i & 0xff) == 0xff || (waiting > 1 && i % waiting == 0)) {
+         parkNanos(MICROSECONDS.toNanos(10));
+      }
+      else {
+         Thread.yield();
+      }
+   }
+
+   @SuppressWarnings("unchecked")
+   private T handoffOf(final Waiter waiter)
+   {
+      return (T) waiter.handoff;
    }
 
    /**
